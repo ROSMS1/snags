@@ -1,9 +1,8 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 import plotly.express as px
 from datetime import date, datetime, timedelta
-import os
+from supabase import create_client, Client
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -13,75 +12,59 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "snags_tracker.db")
+# ─── CONNEXION SUPABASE ───────────────────────────────────────────────────────
+@st.cache_resource
+def get_supabase() -> Client:
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    return create_client(url, key)
 
-# ─── CONSTANTES (modèle du fichier Excel) ─────────────────────────────────────
-REGIONS = ["PNR", "SOUTH", "BRAZZAVILLE_POOL", "NORTH_CENTRE", "NORTH"]
-PRIORITIES = ["P1", "P2", "P4", "TIS"]
-CATEGORIES = ["PASSIVE", "ACTIVE", "TOWER", "ENVIRONMENTAL"]
+supabase = get_supabase()
+
+# ─── CONSTANTES ───────────────────────────────────────────────────────────────
+REGIONS        = ["PNR", "SOUTH", "BRAZZAVILLE_POOL", "NORTH_CENTRE", "NORTH"]
+PRIORITIES     = ["P1", "P2", "P4", "TIS"]
+CATEGORIES     = ["PASSIVE", "ACTIVE", "TOWER", "ENVIRONMENTAL"]
 SUB_CATEGORIES = [
     "Active Hardware", "AirCon", "ATS", "Automation", "Aviation light",
     "AVR", "Battery backup", "Breaker", "Control Panel", "Cooling", "DG",
     "DG Battery", "Earthing", "Environmental", "Fiber", "Monitoring",
     "Others", "PWR Dimen", "Rack", "SNE", "TXN/RAN/IPRAN",
 ]
-OWNERS = ["MTN", "MS", "ZTE", "FME", "NOC"]
-STATUSES = ["Open", "Close", "In Progress"]
-SNAG_IDS = ["QA", "PM", "FLM"]
+OWNERS         = ["MTN", "MS", "ZTE", "FME", "NOC"]
+STATUSES       = ["Open", "Close", "In Progress"]
+SNAG_IDS       = ["QA", "PM", "FLM"]
 SITE_CATEGORIES = ["Hub Site", "Terminal Site", "BB Site"]
 
-# ─── DATABASE ─────────────────────────────────────────────────────────────────
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+# ─── HELPERS SUPABASE ─────────────────────────────────────────────────────────
+def load_snags() -> pd.DataFrame:
+    res = supabase.table("snags").select("*").order("id", desc=True).execute()
+    if res.data:
+        return pd.DataFrame(res.data)
+    return pd.DataFrame(columns=["id","site_id","site_name","site_priority","region",
+        "pm_auditor","audit_date","description","category","sub_category","owner",
+        "action_plan","plan_date","deadline","implementer","progress","status",
+        "close_date","comments","spare_request","snag_id_type","created_at"])
 
-def init_db():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS snags (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        site_id TEXT NOT NULL, site_name TEXT NOT NULL,
-        site_priority TEXT, region TEXT, pm_auditor TEXT, audit_date TEXT,
-        description TEXT NOT NULL, category TEXT, sub_category TEXT,
-        owner TEXT, action_plan TEXT, plan_date TEXT, deadline TEXT,
-        implementer TEXT, progress INTEGER DEFAULT 0, status TEXT DEFAULT 'Open',
-        close_date TEXT, comments TEXT, spare_request INTEGER DEFAULT 0,
-        snag_id_type TEXT, created_at TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS materials (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        snag_id INTEGER, site_id TEXT NOT NULL, site_name TEXT NOT NULL,
-        item TEXT NOT NULL, specifications TEXT, qty INTEGER DEFAULT 1,
-        needed TEXT, status TEXT DEFAULT 'Pending', created_at TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS battery_plan (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        site_id TEXT NOT NULL, site_name TEXT NOT NULL, region TEXT,
-        site_priority TEXT, site_category TEXT, first_used_date TEXT,
-        battery_type TEXT, battery_specs TEXT, qty TEXT, donor_site TEXT,
-        requestor TEXT, approval_date TEXT, planned_date TEXT, actual_date TEXT,
-        current_autonomy TEXT, target_autonomy TEXT, battery_health TEXT DEFAULT 'OK',
-        status TEXT DEFAULT 'Open', due_date TEXT, owner TEXT, created_at TEXT)""")
-    conn.commit()
-    conn.close()
+def load_materials() -> pd.DataFrame:
+    res = supabase.table("materials").select("*").order("id", desc=True).execute()
+    if res.data:
+        return pd.DataFrame(res.data)
+    return pd.DataFrame(columns=["id","snag_id","site_id","site_name","item",
+        "specifications","qty","needed","status","created_at"])
 
-init_db()
+def load_battery() -> pd.DataFrame:
+    res = supabase.table("battery_plan").select("*").order("id", desc=True).execute()
+    if res.data:
+        return pd.DataFrame(res.data)
+    return pd.DataFrame(columns=["id","site_id","site_name","region","site_priority",
+        "site_category","first_used_date","battery_type","battery_specs","qty",
+        "donor_site","requestor","approval_date","planned_date","actual_date",
+        "current_autonomy","target_autonomy","battery_health","status","due_date",
+        "owner","created_at"])
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-def load_snags():
-    conn = get_conn()
-    df = pd.read_sql("SELECT * FROM snags ORDER BY id DESC", conn)
-    conn.close()
-    return df
-
-def load_materials():
-    conn = get_conn()
-    df = pd.read_sql("SELECT * FROM materials ORDER BY id DESC", conn)
-    conn.close()
-    return df
-
-def load_battery():
-    conn = get_conn()
-    df = pd.read_sql("SELECT * FROM battery_plan ORDER BY id DESC", conn)
-    conn.close()
-    return df
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def days_left(date_str):
     if not date_str:
@@ -93,16 +76,11 @@ def days_left(date_str):
         return None
 
 def alert_icon(days):
-    if days is None:
-        return "⚪"
-    if days < 0:
-        return "🔴"
-    if days <= 3:
-        return "🔴"
-    if days <= 7:
-        return "🟠"
-    if days <= 14:
-        return "🟡"
+    if days is None: return "⚪"
+    if days < 0:     return "🔴"
+    if days <= 3:    return "🔴"
+    if days <= 7:    return "🟠"
+    if days <= 14:   return "🟡"
     return "🟢"
 
 # ─── CSS ──────────────────────────────────────────────────────────────────────
@@ -144,6 +122,7 @@ with st.sidebar:
     ])
     st.markdown("---")
     st.markdown(f"📅 **{date.today().strftime('%d/%m/%Y')}**")
+    st.markdown("🗄️ *Base : Supabase Cloud*")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DASHBOARD
@@ -152,10 +131,10 @@ if page == "🏠 Dashboard":
     st.title("📊 Dashboard – FLM Snags Tracker")
     df = load_snags()
 
-    total = len(df)
-    open_s   = int(df[df["status"] == "Open"]["id"].count()) if total else 0
-    closed_s = int(df[df["status"] == "Close"]["id"].count()) if total else 0
-    in_prog  = int(df[df["status"] == "In Progress"]["id"].count()) if total else 0
+    total    = len(df)
+    open_s   = len(df[df["status"] == "Open"])   if total else 0
+    closed_s = len(df[df["status"] == "Close"])  if total else 0
+    in_prog  = len(df[df["status"] == "In Progress"]) if total else 0
     overdue  = 0
     if total:
         for _, row in df[df["status"] != "Close"].iterrows():
@@ -164,14 +143,13 @@ if page == "🏠 Dashboard":
                 overdue += 1
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    cards = [
-        (c1, total,    "Total Snags",     "#0f3460"),
-        (c2, open_s,   "🔴 Open",          "#e53e3e"),
-        (c3, closed_s, "✅ Clôturés",      "#38a169"),
-        (c4, in_prog,  "🔧 En Cours",      "#dd6b20"),
-        (c5, overdue,  "⚠️ En Retard",     "#c53030"),
-    ]
-    for col, val, lbl, bg in cards:
+    for col, val, lbl, bg in [
+        (c1, total,    "Total Snags",  "#0f3460"),
+        (c2, open_s,   "🔴 Open",       "#e53e3e"),
+        (c3, closed_s, "✅ Clôturés",   "#38a169"),
+        (c4, in_prog,  "🔧 En Cours",   "#dd6b20"),
+        (c5, overdue,  "⚠️ En Retard",  "#c53030"),
+    ]:
         with col:
             st.markdown(f'<div class="metric-card" style="background:{bg}"><div class="val">{val}</div><div class="lbl">{lbl}</div></div>', unsafe_allow_html=True)
 
@@ -180,7 +158,6 @@ if page == "🏠 Dashboard":
     else:
         st.markdown("---")
         col_a, col_b = st.columns(2)
-
         with col_a:
             st.markdown('<div class="sec-title">Snags par Sous-Catégorie</div>', unsafe_allow_html=True)
             sub_tot   = df.groupby("sub_category").size().reset_index(name="Total")
@@ -190,12 +167,12 @@ if page == "🏠 Dashboard":
             sub_df["Closed"] = sub_df["Closed"].astype(int)
             sub_df["Open"]   = sub_df["Open"].astype(int)
             sub_df["%"]      = (sub_df["Closed"] / sub_df["Total"] * 100).round(1).astype(str) + "%"
-            st.dataframe(sub_df.rename(columns={"sub_category": "Sub-Category"}), use_container_width=True, hide_index=True)
+            st.dataframe(sub_df.rename(columns={"sub_category":"Sub-Category"}), use_container_width=True, hide_index=True)
 
         with col_b:
             st.markdown('<div class="sec-title">Répartition par Statut</div>', unsafe_allow_html=True)
             st_df = df["status"].value_counts().reset_index()
-            st_df.columns = ["Statut", "Nombre"]
+            st_df.columns = ["Statut","Nombre"]
             fig = px.pie(st_df, names="Statut", values="Nombre", hole=0.4,
                          color_discrete_sequence=["#e53e3e","#38a169","#dd6b20"])
             fig.update_layout(margin=dict(t=10,b=10), height=270)
@@ -233,35 +210,35 @@ elif page == "➕ Nouveau Snag":
     with st.form("form_snag", clear_on_submit=True):
         st.markdown('<div class="sec-title">🏗️ Informations du Site</div>', unsafe_allow_html=True)
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-        with r1c1: site_id = st.text_input("Site ID *", placeholder="ex: 2000")
-        with r1c2: site_name = st.text_input("Nom du Site *", placeholder="ex: AEROPORT1")
+        with r1c1: site_id       = st.text_input("Site ID *", placeholder="ex: 2000")
+        with r1c2: site_name     = st.text_input("Nom du Site *", placeholder="ex: AEROPORT1")
         with r1c3: site_priority = st.selectbox("Priorité", PRIORITIES)
-        with r1c4: region = st.selectbox("Région", REGIONS)
+        with r1c4: region        = st.selectbox("Région", REGIONS)
 
         r2c1, r2c2, r2c3 = st.columns(3)
-        with r2c1: pm_auditor = st.text_input("PM / Auditeur", placeholder="ex: Edna")
-        with r2c2: audit_date = st.date_input("Date Audit PM", value=date.today())
+        with r2c1: pm_auditor  = st.text_input("PM / Auditeur", placeholder="ex: Edna")
+        with r2c2: audit_date  = st.date_input("Date Audit PM", value=date.today())
         with r2c3: snag_id_type = st.selectbox("Snag Identification", SNAG_IDS)
 
         st.markdown('<div class="sec-title">⚠️ Description du Snag</div>', unsafe_allow_html=True)
         description = st.text_area("Description *", placeholder="Décrivez le problème observé...", height=80)
 
         r3c1, r3c2 = st.columns(2)
-        with r3c1: category = st.selectbox("Catégorie", CATEGORIES)
+        with r3c1: category     = st.selectbox("Catégorie", CATEGORIES)
         with r3c2: sub_category = st.selectbox("Sous-Catégorie", SUB_CATEGORIES)
 
         st.markdown('<div class="sec-title">📋 Plan d\'Action & Responsabilité</div>', unsafe_allow_html=True)
         action_plan = st.text_area("Plan d'Action", placeholder="Actions correctives à mener...", height=75)
 
         r4c1, r4c2, r4c3, r4c4 = st.columns(4)
-        with r4c1: plan_date = st.date_input("Date Planifiée", value=date.today())
-        with r4c2: deadline = st.date_input("Deadline *", value=date.today() + timedelta(days=30))
-        with r4c3: owner = st.selectbox("Owner", OWNERS)
+        with r4c1: plan_date   = st.date_input("Date Planifiée", value=date.today())
+        with r4c2: deadline    = st.date_input("Deadline *", value=date.today() + timedelta(days=30))
+        with r4c3: owner       = st.selectbox("Owner", OWNERS)
         with r4c4: implementer = st.text_input("Implémenteur", placeholder="ex: Edna/Eric")
 
         r5c1, r5c2 = st.columns(2)
         with r5c1: progress = st.slider("Progression (%)", 0, 100, 0)
-        with r5c2: status = st.selectbox("Statut", STATUSES)
+        with r5c2: status   = st.selectbox("Statut", STATUSES)
 
         close_date = None
         if status == "Close":
@@ -290,30 +267,28 @@ elif page == "➕ Nouveau Snag":
             if not site_id.strip() or not site_name.strip() or not description.strip():
                 st.error("⚠️ Champs obligatoires manquants : Site ID, Nom du Site, Description.")
             else:
-                conn = get_conn()
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO snags
-                    (site_id,site_name,site_priority,region,pm_auditor,audit_date,
-                     description,category,sub_category,owner,action_plan,plan_date,
-                     deadline,implementer,progress,status,close_date,comments,
-                     spare_request,snag_id_type)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (site_id.strip(), site_name.strip(), site_priority, region,
-                      pm_auditor, audit_date.isoformat(), description, category,
-                      sub_category, owner, action_plan, plan_date.isoformat(),
-                      deadline.isoformat(), implementer, progress, status,
-                      close_date.isoformat() if close_date else None,
-                      comments, 1 if spare_request else 0, snag_id_type))
-                new_id = cur.lastrowid
+                res = supabase.table("snags").insert({
+                    "site_id": site_id.strip(), "site_name": site_name.strip(),
+                    "site_priority": site_priority, "region": region,
+                    "pm_auditor": pm_auditor, "audit_date": audit_date.isoformat(),
+                    "description": description, "category": category,
+                    "sub_category": sub_category, "owner": owner,
+                    "action_plan": action_plan, "plan_date": plan_date.isoformat(),
+                    "deadline": deadline.isoformat(), "implementer": implementer,
+                    "progress": progress, "status": status,
+                    "close_date": close_date.isoformat() if close_date else None,
+                    "comments": comments, "spare_request": 1 if spare_request else 0,
+                    "snag_id_type": snag_id_type, "created_at": now_str()
+                }).execute()
+                new_id = res.data[0]["id"] if res.data else None
                 for (itm, spc, qty_, ndd) in mat_rows:
                     if itm:
-                        cur.execute("""
-                            INSERT INTO materials (snag_id,site_id,site_name,item,specifications,qty,needed)
-                            VALUES (?,?,?,?,?,?,?)
-                        """, (new_id, site_id.strip(), site_name.strip(), itm, spc, qty_, ndd))
-                conn.commit()
-                conn.close()
+                        supabase.table("materials").insert({
+                            "snag_id": new_id, "site_id": site_id.strip(),
+                            "site_name": site_name.strip(), "item": itm,
+                            "specifications": spc, "qty": int(qty_),
+                            "needed": ndd, "created_at": now_str()
+                        }).execute()
                 st.success(f"✅ Snag #{new_id} enregistré avec succès !")
                 st.balloons()
 
@@ -329,10 +304,10 @@ elif page == "📋 Liste des Snags":
     else:
         st.markdown("### 🔍 Filtres")
         fc1, fc2, fc3, fc4 = st.columns(4)
-        with fc1: f_region = st.multiselect("Région", REGIONS)
-        with fc2: f_status = st.multiselect("Statut", STATUSES)
+        with fc1: f_region = st.multiselect("Région",         REGIONS)
+        with fc2: f_status = st.multiselect("Statut",         STATUSES)
         with fc3: f_subcat = st.multiselect("Sous-Catégorie", SUB_CATEGORIES)
-        with fc4: f_owner  = st.multiselect("Owner", OWNERS)
+        with fc4: f_owner  = st.multiselect("Owner",          OWNERS)
 
         mask = pd.Series([True]*len(df))
         if f_region: mask &= df["region"].isin(f_region)
@@ -361,7 +336,7 @@ elif page == "📋 Liste des Snags":
         id_list = filtered["id"].tolist()
         if id_list:
             sel = st.selectbox("Sélectionner l'ID du Snag", id_list,
-                               format_func=lambda x: f"#{x} – {df[df['id']==x]['site_name'].values[0]} – {df[df['id']==x]['description'].values[0][:50]}")
+                format_func=lambda x: f"#{x} – {df[df['id']==x]['site_name'].values[0]} – {df[df['id']==x]['description'].values[0][:50]}")
             row = df[df["id"] == sel].iloc[0]
             with st.form(f"edit_{sel}"):
                 ec1, ec2, ec3 = st.columns(3)
@@ -373,8 +348,8 @@ elif page == "📋 Liste des Snags":
                 with ec3:
                     new_implementer = st.text_input("Implémenteur", value=row["implementer"] or "")
 
-                new_action   = st.text_area("Plan d'Action", value=row["action_plan"] or "")
-                new_comments = st.text_area("Commentaires", value=row["comments"] or "")
+                new_action   = st.text_area("Plan d'Action",  value=row["action_plan"] or "")
+                new_comments = st.text_area("Commentaires",   value=row["comments"] or "")
 
                 ec4, ec5 = st.columns(2)
                 with ec4:
@@ -389,14 +364,12 @@ elif page == "📋 Liste des Snags":
                         new_close = st.date_input("Date Clôture", value=date.today())
 
                 if st.form_submit_button("💾 Sauvegarder", type="primary"):
-                    conn = get_conn()
-                    conn.execute("""
-                        UPDATE snags SET status=?,progress=?,implementer=?,
-                        action_plan=?,comments=?,deadline=?,close_date=? WHERE id=?
-                    """, (new_status, new_progress, new_implementer, new_action,
-                          new_comments, new_deadline.isoformat(),
-                          new_close.isoformat() if new_close else row["close_date"], sel))
-                    conn.commit(); conn.close()
+                    supabase.table("snags").update({
+                        "status": new_status, "progress": new_progress,
+                        "implementer": new_implementer, "action_plan": new_action,
+                        "comments": new_comments, "deadline": new_deadline.isoformat(),
+                        "close_date": new_close.isoformat() if new_close else row["close_date"]
+                    }).eq("id", int(sel)).execute()
                     st.success("✅ Snag mis à jour !")
                     st.rerun()
 
@@ -405,8 +378,7 @@ elif page == "📋 Liste des Snags":
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "🔔 Rappels & Alertes":
     st.title("🔔 Rappels & Alertes – Deadlines")
-
-    df = load_snags()
+    df  = load_snags()
     bdf = load_battery()
 
     open_snags = df[df["status"] != "Close"].copy() if not df.empty else pd.DataFrame()
@@ -419,7 +391,6 @@ elif page == "🔔 Rappels & Alertes":
         critical = has_date[(has_date["days"] >= 0) & (has_date["days"] <= 3)]
         warning  = has_date[(has_date["days"] > 3)  & (has_date["days"] <= 7)]
         caution  = has_date[(has_date["days"] > 7)  & (has_date["days"] <= 14)]
-        ok       = has_date[has_date["days"] > 14]
 
         s1, s2, s3, s4, s5 = st.columns(5)
         for col, val, lbl, bg in [
@@ -427,7 +398,7 @@ elif page == "🔔 Rappels & Alertes":
             (s2, len(critical), "🔴 Critique ≤3j",  "#e53e3e"),
             (s3, len(warning),  "🟠 Attention ≤7j", "#dd6b20"),
             (s4, len(caution),  "🟡 Vigilance ≤14j","#d69e2e"),
-            (s5, len(ok),       "🟢 OK",             "#2f855a"),
+            (s5, len(has_date[has_date["days"] > 14]), "🟢 OK", "#2f855a"),
         ]:
             with col:
                 st.markdown(f'<div class="metric-card" style="background:{bg}"><div class="val">{val}</div><div class="lbl">{lbl}</div></div>', unsafe_allow_html=True)
@@ -435,8 +406,7 @@ elif page == "🔔 Rappels & Alertes":
         st.markdown("---")
 
         def render_alerts(grp, title, cls, icon):
-            if grp.empty:
-                return
+            if grp.empty: return
             st.markdown(f"### {icon} {title} ({len(grp)})")
             for _, r in grp.iterrows():
                 d = int(r["days"])
@@ -452,10 +422,10 @@ elif page == "🔔 Rappels & Alertes":
                 </div>
                 """, unsafe_allow_html=True)
 
-        render_alerts(overdue,  "Snags EN RETARD",                    "a-red",    "🔴")
-        render_alerts(critical, "Snags CRITIQUES (≤ 3 jours)",        "a-red",    "🔴")
-        render_alerts(warning,  "Snags – Attention (≤ 7 jours)",      "a-orange", "🟠")
-        render_alerts(caution,  "Snags – Vigilance (≤ 14 jours)",     "a-yellow", "🟡")
+        render_alerts(overdue,  "Snags EN RETARD",             "a-red",    "🔴")
+        render_alerts(critical, "Snags CRITIQUES (≤ 3 jours)", "a-red",    "🔴")
+        render_alerts(warning,  "Snags – Attention (≤ 7j)",    "a-orange", "🟠")
+        render_alerts(caution,  "Snags – Vigilance (≤ 14j)",   "a-yellow", "🟡")
 
         no_dl = open_snags[open_snags["deadline"].isna() | (open_snags["deadline"] == "")]
         if not no_dl.empty:
@@ -464,7 +434,6 @@ elif page == "🔔 Rappels & Alertes":
     else:
         st.success("✅ Aucun snag ouvert avec une deadline imminente !")
 
-    # Alertes batteries
     if not bdf.empty:
         bopen = bdf[bdf["status"] == "Open"].copy()
         bopen["days"] = bopen["planned_date"].apply(days_left)
@@ -497,7 +466,7 @@ elif page == "🔧 Besoins Matériels":
             st.info("Aucun besoin matériel enregistré.")
         else:
             mc1, mc2 = st.columns(2)
-            with mc1: f_site = st.multiselect("Site", dfm["site_name"].unique().tolist())
+            with mc1: f_site = st.multiselect("Site",   dfm["site_name"].unique().tolist())
             with mc2: f_mst  = st.multiselect("Statut", ["Pending","Ordered","Received","Installed"])
 
             mm = pd.Series([True]*len(dfm))
@@ -511,7 +480,6 @@ elif page == "🔧 Besoins Matériels":
                 "needed":"Needed","status":"Statut","created_at":"Créé le"
             }), use_container_width=True, hide_index=True)
 
-            # Résumé visuel
             if not fdfm.empty:
                 st.markdown("---")
                 st.markdown("### 📊 Résumé par Statut")
@@ -522,19 +490,16 @@ elif page == "🔧 Besoins Matériels":
                 figm.update_layout(xaxis_title="", yaxis_title="Articles", height=300, margin=dict(t=10,b=10))
                 st.plotly_chart(figm, use_container_width=True)
 
-            # Mise à jour
             st.markdown("---")
             st.markdown("### ✏️ Mettre à jour le statut")
             if not fdfm.empty:
-                mat_sel = st.selectbox("ID Matériel",
-                    fdfm["id"].tolist(),
+                mat_sel = st.selectbox("ID Matériel", fdfm["id"].tolist(),
                     format_func=lambda x: f"#{x} – {dfm[dfm['id']==x]['site_name'].values[0]} – {dfm[dfm['id']==x]['item'].values[0]}")
                 new_mst = st.selectbox("Nouveau Statut", ["Pending","Ordered","Received","Installed"])
                 if st.button("💾 Mettre à Jour Statut"):
-                    conn = get_conn()
-                    conn.execute("UPDATE materials SET status=? WHERE id=?", (new_mst, mat_sel))
-                    conn.commit(); conn.close()
-                    st.success("✅ Statut mis à jour !"); st.rerun()
+                    supabase.table("materials").update({"status": new_mst}).eq("id", int(mat_sel)).execute()
+                    st.success("✅ Statut mis à jour !")
+                    st.rerun()
 
     with tab_add:
         st.markdown("### ➕ Ajouter un besoin matériel")
@@ -568,13 +533,15 @@ elif page == "🔧 Besoins Matériels":
                     if snag_ref != "Aucun":
                         try: ref_id = int(snag_ref.split("–")[0].replace("#","").strip())
                         except Exception: pass
-                    conn = get_conn()
-                    conn.execute("""
-                        INSERT INTO materials (snag_id,site_id,site_name,item,specifications,qty,needed,status)
-                        VALUES (?,?,?,?,?,?,?,?)
-                    """, (ref_id, mat_site_id, mat_site_name, mat_item, mat_specs, mat_qty, mat_ndd, mat_st_new))
-                    conn.commit(); conn.close()
-                    st.success("✅ Matériel enregistré !"); st.rerun()
+                    supabase.table("materials").insert({
+                        "snag_id": ref_id, "site_id": mat_site_id,
+                        "site_name": mat_site_name, "item": mat_item,
+                        "specifications": mat_specs, "qty": int(mat_qty),
+                        "needed": mat_ndd, "status": mat_st_new,
+                        "created_at": now_str()
+                    }).execute()
+                    st.success("✅ Matériel enregistré !")
+                    st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PLAN BATTERIES
@@ -612,10 +579,10 @@ elif page == "🔋 Plan Batteries":
                 "battery_health":"Santé","status":"Statut","owner":"Owner"
             }), use_container_width=True, hide_index=True)
 
-            b1,b2,b3 = st.columns(3)
+            b1, b2, b3 = st.columns(3)
             with b1: st.metric("Total Sites", len(bdf))
-            with b2: st.metric("Open", len(bdf[bdf["status"]=="Open"]))
-            with b3: st.metric("Clôturés", len(bdf[bdf["status"]=="closed"]))
+            with b2: st.metric("Open",        len(bdf[bdf["status"]=="Open"]))
+            with b3: st.metric("Clôturés",    len(bdf[bdf["status"]=="closed"]))
 
             st.markdown("---")
             st.markdown("### ✏️ Mettre à jour un plan batterie")
@@ -637,59 +604,62 @@ elif page == "🔋 Plan Batteries":
                         nb_auto = st.text_input("Autonomie Actuelle", value=brow["current_autonomy"] or "")
                     nb_actual = st.date_input("Date Réelle Installation", value=date.today())
                     if st.form_submit_button("💾 Mettre à Jour", type="primary"):
-                        conn = get_conn()
-                        conn.execute("""
-                            UPDATE battery_plan SET status=?,battery_health=?,
-                            current_autonomy=?,actual_date=? WHERE id=?
-                        """, (nb_st, nb_health, nb_auto, nb_actual.isoformat(), sel_b))
-                        conn.commit(); conn.close()
-                        st.success("✅ Mis à jour !"); st.rerun()
+                        supabase.table("battery_plan").update({
+                            "status": nb_st, "battery_health": nb_health,
+                            "current_autonomy": nb_auto,
+                            "actual_date": nb_actual.isoformat()
+                        }).eq("id", int(sel_b)).execute()
+                        st.success("✅ Mis à jour !")
+                        st.rerun()
 
     with tab_ba:
         st.markdown("### ➕ Ajouter un site au plan de remplacement")
         with st.form("form_batt"):
-            nb1,nb2,nb3,nb4 = st.columns(4)
-            with nb1: nbs_id   = st.text_input("Site ID *", placeholder="ex: 4106")
-            with nb2: nbs_name = st.text_input("Nom du Site *", placeholder="ex: DOLISIE2")
-            with nb3: nbs_reg  = st.selectbox("Région", REGIONS)
-            with nb4: nbs_pri  = st.selectbox("Priorité", PRIORITIES)
+            nb1, nb2, nb3, nb4 = st.columns(4)
+            with nb1: nbs_id   = st.text_input("Site ID *",      placeholder="ex: 4106")
+            with nb2: nbs_name = st.text_input("Nom du Site *",   placeholder="ex: DOLISIE2")
+            with nb3: nbs_reg  = st.selectbox("Région",           REGIONS)
+            with nb4: nbs_pri  = st.selectbox("Priorité",         PRIORITIES)
 
             nb5, nb6 = st.columns(2)
-            with nb5: nbs_cat   = st.selectbox("Catégorie Site", SITE_CATEGORIES)
-            with nb6: nbs_fu    = st.date_input("Date 1ère Installation", value=date.today())
+            with nb5: nbs_cat = st.selectbox("Catégorie Site",    SITE_CATEGORIES)
+            with nb6: nbs_fu  = st.date_input("Date 1ère Installation", value=date.today())
 
-            nb7,nb8,nb9 = st.columns(3)
-            with nb7: nbs_btype = st.text_input("Type Batterie", placeholder="ex: 6-FMX 12V135Ah")
+            nb7, nb8, nb9 = st.columns(3)
+            with nb7: nbs_btype = st.text_input("Type Batterie",  placeholder="ex: 6-FMX 12V135Ah")
             with nb8: nbs_bspec = st.text_input("Spécifications", placeholder="ex: 135Ah")
-            with nb9: nbs_qty   = st.text_input("Quantité", placeholder="ex: 8")
+            with nb9: nbs_qty   = st.text_input("Quantité",       placeholder="ex: 8")
 
             nb10, nb11 = st.columns(2)
             with nb10: nbs_plan  = st.date_input("Date Planifiée Remplacement", value=date.today() + timedelta(days=30))
-            with nb11: nbs_owner = st.text_input("Owner", placeholder="ex: Clevy/Bob")
+            with nb11: nbs_owner = st.text_input("Owner",         placeholder="ex: Clevy/Bob")
 
-            nb12,nb13,nb14 = st.columns(3)
+            nb12, nb13, nb14 = st.columns(3)
             with nb12: nbs_cauto  = st.text_input("Autonomie Actuelle", placeholder="ex: 2hr")
-            with nb13: nbs_tauto  = st.text_input("Autonomie Cible", placeholder="ex: 4hr")
-            with nb14: nbs_health = st.selectbox("Santé Batterie", ["OK","NOK","—"])
+            with nb13: nbs_tauto  = st.text_input("Autonomie Cible",    placeholder="ex: 4hr")
+            with nb14: nbs_health = st.selectbox("Santé Batterie",      ["OK","NOK","—"])
 
             nbs_donor = st.text_input("Donor Site (Site/WH)", placeholder="ex: WH")
-            nbs_req   = st.text_input("Requesteur", placeholder="ex: Prince")
+            nbs_req   = st.text_input("Requesteur",           placeholder="ex: Prince")
 
             if st.form_submit_button("💾 Enregistrer", type="primary", use_container_width=True):
                 if not nbs_id or not nbs_name:
                     st.error("⚠️ Site ID et Nom sont obligatoires.")
                 else:
-                    conn = get_conn()
-                    conn.execute("""
-                        INSERT INTO battery_plan
-                        (site_id,site_name,region,site_priority,site_category,
-                         first_used_date,battery_type,battery_specs,qty,donor_site,
-                         requestor,planned_date,current_autonomy,target_autonomy,
-                         battery_health,status,owner)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (nbs_id, nbs_name, nbs_reg, nbs_pri, nbs_cat,
-                          nbs_fu.isoformat(), nbs_btype, nbs_bspec, nbs_qty,
-                          nbs_donor, nbs_req, nbs_plan.isoformat(), nbs_cauto,
-                          nbs_tauto, nbs_health, "Open", nbs_owner))
-                    conn.commit(); conn.close()
-                    st.success("✅ Site ajouté au plan de remplacement !"); st.rerun()
+                    supabase.table("battery_plan").insert({
+                        "site_id": nbs_id, "site_name": nbs_name,
+                        "region": nbs_reg, "site_priority": nbs_pri,
+                        "site_category": nbs_cat,
+                        "first_used_date": nbs_fu.isoformat(),
+                        "battery_type": nbs_btype, "battery_specs": nbs_bspec,
+                        "qty": nbs_qty, "donor_site": nbs_donor,
+                        "requestor": nbs_req,
+                        "planned_date": nbs_plan.isoformat(),
+                        "current_autonomy": nbs_cauto,
+                        "target_autonomy": nbs_tauto,
+                        "battery_health": nbs_health,
+                        "status": "Open", "owner": nbs_owner,
+                        "created_at": now_str()
+                    }).execute()
+                    st.success("✅ Site ajouté au plan de remplacement !")
+                    st.rerun()
